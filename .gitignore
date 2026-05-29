@@ -1,0 +1,20 @@
+# 원본 데이터 (Kaggle에서 직접 로드)
+data/
+
+# 전처리 출력물 (01_preprocessing.ipynb 실행 후 로컬/Kaggle working에 생성됨)
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# 모델 가중치
+*.pt
+*.pth
+*.h5
+
+# 환경
+.env
+*.egg-info/
