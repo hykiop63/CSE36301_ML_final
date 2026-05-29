@@ -4,6 +4,9 @@ data/
 # 전처리 출력물 (01_preprocessing.ipynb 실행 후 로컬/Kaggle working에 생성됨)
 outputs/
 
+# splits/는 git 추적 — 팀 전체 동일 split 보장용 증거 파일
+# splits/*.npy (~1.6MB) 는 커밋됨
+
 # Python
 __pycache__/
 *.pyc
@@ -18,3 +21,4 @@ __pycache__/
 # 환경
 .env
 *.egg-info/
+.venv/
