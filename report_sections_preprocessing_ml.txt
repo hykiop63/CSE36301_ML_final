@@ -1,0 +1,200 @@
+################################################################################
+# ENGLISH VERSION
+################################################################################
+
+--------------------------------------------------------------------------------
+ (1) Dataset and Preprocessing   [-> replaces/expands §2.1 Dataset]
+--------------------------------------------------------------------------------
+
+We use the Quora Question Pairs dataset, a binary duplicate-detection benchmark
+of 404,290 question pairs, each containing two natural-language questions and a
+label of semantic equivalence. The task mixes shallow lexical overlap with
+paraphrase matching, so a model must reason about both surface form and meaning.
+
+Two properties drive every later design choice. First, the classes are
+imbalanced (duplicates 36.9% vs non-duplicates 63.1%), so accuracy alone is
+misleading and we report F1 and log loss as primary metrics. Second, the
+word-overlap ratio between the two questions is by far the strongest single
+separating signal, which motivates the hand-crafted features below. Questions are
+short (~11 words on average, mostly under 20). The three missing question fields
+are filled with the empty string.
+
+Shared split for reproducibility. The corpus is split into 323,432 / 40,429 /
+40,429 (train/val/test; 80/10/10 stratified, random_state=42). We freeze the
+split indices and share them across the team via version control, so every model
+family (traditional ML, Siamese LSTM, Bi-/Cross-Encoder) trains and evaluates on
+identical partitions -- making the cross-model comparison a fair, like-for-like
+benchmark. To prevent leakage, the TF-IDF vocabulary and all token dictionaries
+are fit on the training split only.
+
+Model-specific cleaning. We load raw text once and branch into three pipelines
+whose cleaning intensity is matched to the consumer model. Traditional ML and the
+LSTM get aggressively normalized text (lowercasing, contraction expansion,
+punctuation removal); numbers are kept for ML (e.g. "iphone 14") but dropped for
+the LSTM. BERT instead gets minimal cleaning (HTML & whitespace only), since
+WordPiece handles casing/punctuation internally.
+
+  Pipeline   | Target model    | Cleaning
+  -----------+-----------------+--------------------------------------------------
+  for_ml     | Traditional ML  | lowercase + expand contractions + strip punct., keep numbers
+  for_lstm   | Siamese LSTM    | same, but remove numbers
+  for_bert   | BERT Cross-Enc. | minimal (HTML & whitespace only)
+
+Features for traditional ML. The for_ml pipeline produces two complementary
+views. (i) 10 hand-crafted features: per-question char length & word count,
+absolute length difference & mean length, common-word & total-word counts, the
+word-share ratio |A∩B|/(|A|+|B|), and the TF-IDF cosine similarity. (ii) A TF-IDF
+view (unigrams, English stopwords removed, min_df=2, sublinear_tf) where each
+question is vectorized separately and the vectors are horizontally stacked,
+giving a sparse 323,432 x 93,012 training matrix.
+
+--------------------------------------------------------------------------------
+ (2) Traditional ML Baselines   [-> new subsection in §3 Results]
+--------------------------------------------------------------------------------
+
+The traditional baselines establish how far purely lexical signals carry and
+anchor the neural comparison. We evaluate eight classifiers across the two
+feature views: Logistic Regression (hand & TF-IDF), a calibrated Linear SVM,
+Multinomial Naive Bayes, Decision Tree, Random Forest, Gradient Boosting, and
+XGBoost.
+
+Feature engineering: tfidf_word_share. For the tree ensembles we add an
+IDF-weighted overlap feature (inspired by the anokas Kaggle baseline): instead of
+counting shared words equally, each shared word is weighted by its inverse
+document frequency,
+    tfidf_word_share = sum_{w in A∩B} idf(w) / sum_{w in A∪B} idf(w),
+so overlap on rare, content-bearing words counts more. It is computed directly
+from the stored TF-IDF matrices, bringing the ensemble hand-feature count to 11.
+
+Tuning protocol. Hyperparameters are selected by minimizing validation log loss
+over a small per-model grid (C for linear models, alpha for NB, max_depth /
+learning_rate / subsample for ensembles). We tune on the held-out validation
+split directly rather than k-fold CV, since the 323K-row training set makes
+repeated CV refits prohibitively expensive; the frozen split keeps this honest.
+Test metrics are reported for the refit best configuration.
+
+  Model                | Features | Val F1 | Test Acc | Test F1 | Log loss | Size (KB)
+  ---------------------+----------+--------+----------+---------+----------+----------
+  Logistic Regression  | Hand     | 0.499  | 0.655    | 0.505   | 0.563    | 0.8
+  Logistic Regression  | TF-IDF   | 0.630  | 0.755    | 0.628   | 0.512    | 727
+  Linear SVM           | TF-IDF   | 0.621  | 0.746    | 0.640   | 0.514    | 2,182
+  Naive Bayes          | TF-IDF   | 0.636  | 0.745    | 0.633   | 0.599    | 2,907
+  Decision Tree        | Hand     | 0.628  | 0.709    | 0.632   | 0.508    | 40
+  Random Forest        | Hand     | 0.647  | 0.727    | 0.646   | 0.487    | 414,826
+  Gradient Boosting    | Hand     | 0.644  | 0.729    | 0.645   | 0.484    | 1,766
+  XGBoost              | Hand+    | 0.653* | 0.733    | 0.651*  | 0.480*   | 4,188
+  (* = best in column)
+
+Findings. Because the classes are imbalanced, we rank models by F1 and log loss
+rather than accuracy. By that criterion the hand-feature boosted trees win:
+XGBoost is the strongest baseline overall (best F1 0.651, lowest/best-calibrated
+log loss 0.480), because its IDF-weighted overlap and length features recover
+more of the minority duplicate class. The TF-IDF linear models post slightly
+higher raw accuracy (LR 0.755) but lower F1 (~0.62-0.64); accuracy mostly rewards
+predicting the majority non-duplicate class, so under the imbalance-aware metric
+they fall behind the ensembles.
+tfidf_word_share is consistently the most important ensemble feature. The best
+tree models reach this F1 with a ~4 MB checkpoint and sub-ms inference, whereas
+Random Forest pays a 400 MB footprint for slightly worse numbers.
+
+Limitation -> motivation for deep models. Across every classifier, F1 plateaus
+around 0.65 (and accuracy at 73-76%). The ceiling is structural: all these
+features ultimately measure lexical overlap, so they miss duplicates phrased with
+different words -- e.g. "How to learn Python" vs "Best way to study Python" share
+almost no tokens yet mean the same. Closing this semantic gap motivates the
+contextual models that follow (Word2Vec + LSTM, Transformer Bi-/Cross-Encoders).
+
+
+################################################################################
+# 한국어 버전 (KOREAN VERSION)
+################################################################################
+
+--------------------------------------------------------------------------------
+ ① 데이터셋 및 전처리   [-> §2.1 Dataset 자리에 교체/확장]
+--------------------------------------------------------------------------------
+
+본 연구는 Quora Question Pairs 데이터셋을 사용한다. 두 개의 자연어 질문과 의미적
+동등성 여부 레이블로 구성된 404,290건의 질문 쌍 이진 분류 벤치마크다. 이 과제는
+표면적인 단어 겹침과 패러프레이즈(의역) 매칭이 섞여 있어, 모델이 표면 형태와 의미를
+모두 다뤄야 하므로 모델 비교에 적합하다.
+
+이후의 모든 설계 결정은 데이터의 두 가지 성질에서 출발한다. 첫째, 클래스가
+불균형하다(중복 36.9% vs 비중복 63.1%). 따라서 정확도만으로는 오해의 소지가 있어
+F1과 log loss를 주 지표로 보고한다. 둘째, 두 질문 간 단어 겹침 비율(word-overlap)이
+가장 강력한 단일 구분 신호이며, 이것이 아래 수동 피처 설계의 근거가 된다. 질문은 짧은
+편으로 평균 약 11단어, 대부분 20단어 이내다. 결측된 질문 3건은 빈 문자열로 대체했다.
+
+재현성을 위한 공통 split. 전체 데이터를 323,432 / 40,429 / 40,429
+(train/val/test; 80/10/10 stratified, random_state=42)로 분할한다. 분할 인덱스를
+고정하여 버전 관리로 팀 전체가 공유하므로, 모든 모델 계열(전통 ML, Siamese LSTM,
+Bi-/Cross-Encoder)이 동일한 분할에서 학습·평가된다. 이로써 모델 간 비교가 공정한 동일
+조건 벤치마크가 된다. 데이터 누수를 막기 위해 TF-IDF 사전과 모든 토큰 사전은 학습
+split만으로 fit한다.
+
+모델별 맞춤 클리닝. 원본 텍스트를 한 번만 로딩한 뒤, 소비 모델에 맞춰 클리닝 강도를
+달리한 세 파이프라인으로 분기한다. 전통 ML과 LSTM은 강하게 정규화된 텍스트(소문자화,
+축약어 확장, 구두점 제거)를 받는다. 숫자는 ML에서는 유지("iphone 14" 등)하지만
+LSTM에서는 제거한다. 반면 BERT는 최소 클리닝(HTML·공백만)만 적용하는데, WordPiece가
+대소문자·구두점을 자체적으로 처리하기 때문이다.
+
+  파이프라인 | 대상 모델       | 클리닝
+  -----------+-----------------+--------------------------------------------------
+  for_ml     | 전통 ML         | 소문자화 + 축약어 확장 + 구두점 제거, 숫자 유지
+  for_lstm   | Siamese LSTM    | 위와 동일, 단 숫자 제거
+  for_bert   | BERT Cross-Enc. | 최소 클리닝(HTML·공백만)
+
+전통 ML용 피처. for_ml 파이프라인은 두 가지 상호 보완적 표현을 만든다. (i) 수동 피처
+10개: 질문별 문자 길이·단어 수, 길이 차의 절댓값·평균 길이, 공통 단어 수·전체 단어 수,
+word-share 비율 |A∩B|/(|A|+|B|), TF-IDF 코사인 유사도. (ii) TF-IDF 표현(unigram,
+영어 불용어 제거, min_df=2, sublinear_tf): 두 질문을 각각 벡터화한 뒤 수평으로 이어
+붙여, 희소 행렬 기준 학습 데이터가 323,432 x 93,012 크기가 된다.
+
+--------------------------------------------------------------------------------
+ ② 전통 ML 베이스라인   [-> §3 Results 안에 새 subsection]
+--------------------------------------------------------------------------------
+
+전통 베이스라인은 순수 어휘 신호만으로 어디까지 도달하는지를 확립하고, 신경망 비교의
+기준점이 된다. 두 가지 피처 표현에 대해 8개 분류기를 평가한다: Logistic
+Regression(수동 피처 & TF-IDF), 보정(calibrated)된 Linear SVM, Multinomial Naive
+Bayes, Decision Tree, Random Forest, Gradient Boosting, XGBoost.
+
+피처 엔지니어링: tfidf_word_share. 트리 앙상블에는 IDF 가중 겹침 피처(anokas Kaggle
+베이스라인 기반)를 추가한다. 공통 단어를 동일하게 세는 대신, 각 공통 단어를
+역문서빈도(IDF)로 가중한다.
+    tfidf_word_share = sum_{w in A∩B} idf(w) / sum_{w in A∪B} idf(w)
+즉 희귀하고 내용을 담은 단어가 겹칠수록 더 높은 점수를 준다. 저장된 TF-IDF 행렬에서
+직접 계산하며, 이로써 앙상블의 수동 피처는 11개가 된다.
+
+튜닝 프로토콜. 하이퍼파라미터는 모델별 소규모 그리드에서 validation log loss 최소화
+기준으로 선택한다(선형 모델의 C, NB의 alpha, 앙상블의 max_depth / learning_rate /
+subsample 등). k-fold CV 대신 held-out validation split에서 직접 튜닝하는데, 323K 행
+학습 데이터에서 반복 CV 재학습은 비용이 과도하기 때문이다. 고정된 split이 이 선택을
+공정하게 유지한다. 테스트 지표는 재학습된 최적 구성에 대해 보고한다.
+
+  모델                 | 피처     | Val F1 | Test Acc | Test F1 | Log loss | 크기(KB)
+  ---------------------+----------+--------+----------+---------+----------+----------
+  Logistic Regression  | Hand     | 0.499  | 0.655    | 0.505   | 0.563    | 0.8
+  Logistic Regression  | TF-IDF   | 0.630  | 0.755    | 0.628   | 0.512    | 727
+  Linear SVM           | TF-IDF   | 0.621  | 0.746    | 0.640   | 0.514    | 2,182
+  Naive Bayes          | TF-IDF   | 0.636  | 0.745    | 0.633   | 0.599    | 2,907
+  Decision Tree        | Hand     | 0.628  | 0.709    | 0.632   | 0.508    | 40
+  Random Forest        | Hand     | 0.647  | 0.727    | 0.646   | 0.487    | 414,826
+  Gradient Boosting    | Hand     | 0.644  | 0.729    | 0.645   | 0.484    | 1,766
+  XGBoost              | Hand+    | 0.653* | 0.733    | 0.651*  | 0.480*   | 4,188
+  (* = 해당 열 최고값)
+
+결과 해석. 클래스가 불균형하므로 모델은 정확도가 아니라 F1과 log loss로 평가한다. 이
+기준으로는 수동 피처 부스팅 트리가 우위다 -- XGBoost가 전체 최강 베이스라인으로(최고
+F1 0.651, 최저·최적 보정 log loss 0.480), IDF 가중 겹침과 길이 피처 덕에 소수
+클래스(중복)를 더 많이 회수한다. TF-IDF 선형 모델은 원시 정확도는 약간 더 높지만
+(LR 0.755) F1은 더 낮다(~0.62-0.64). 정확도는 주로 다수 클래스(비중복) 예측을
+보상하므로, 불균형을 고려한 지표에서는 앙상블에 뒤처진다. tfidf_word_share는
+앙상블에서 일관되게 가장 중요한 피처다. 또한 최고 트리 모델은 약 4MB 체크포인트와 1ms
+미만 추론으로 이 F1에 도달하는 반면, Random Forest는 400MB를 쓰고도 약간 더 낮은
+수치를 보인다.
+
+한계 -> 딥러닝의 필요성. 모든 분류기에서 F1은 0.65 부근(정확도는 73~76%)에서 정체한다.
+이 천장은 구조적이다. 이 피처들은 결국 어휘 겹침을 측정하므로, 다른 단어로 표현된
+중복을 놓친다 -- 예: "How to learn Python" vs "Best way to study Python"은 공통 토큰이
+거의 없지만 같은 의도다. 이 의미적 간극을 메우는 것이 뒤따르는 문맥 기반 모델
+(Word2Vec + LSTM, Transformer Bi-/Cross-Encoder)의 동기가 된다.

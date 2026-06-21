@@ -1,0 +1,151 @@
+
+% ----------------------------------------------------------------------------
+\subsection{Dataset and Preprocessing}
+% ----------------------------------------------------------------------------
+
+We use the Quora Question Pairs dataset, a binary duplicate-detection benchmark
+of \textbf{404{,}290} question pairs. Each example contains two natural-language
+questions and a label indicating whether they are semantically equivalent. The
+task is a strong testbed for model comparison because it mixes shallow lexical
+overlap with paraphrase matching, so a model must reason about both surface form
+and meaning.
+
+Two properties of the data drive every later design choice. First, the classes
+are \textbf{imbalanced}: only $36.9\%$ of pairs are duplicates versus $63.1\%$
+non-duplicates, so accuracy alone is misleading and we report \textbf{F1} and
+\textbf{log loss} as primary metrics. Second, the \emph{word-overlap ratio}
+between the two questions is by far the strongest single separating signal,
+which motivates the hand-crafted features described below. Questions are short,
+averaging about $11$ words and mostly under $20$. The three missing question
+fields are filled with the empty string.
+
+\paragraph{Shared split for reproducibility.}
+The corpus is divided into \textbf{323{,}432} training, \textbf{40{,}429}
+validation, and \textbf{40{,}429} test examples (an $80/10/10$ stratified split,
+\texttt{random\_state}\,$=42$). We freeze the split \emph{indices} and share them
+across the team via version control, so every model family (traditional ML,
+Siamese LSTM, Bi-/Cross-Encoder) is trained and evaluated on exactly the same
+partitions. This makes the cross-model comparison in Section~3 a
+fair, like-for-like benchmark. To prevent leakage, the TF-IDF vocabulary and all
+token dictionaries are \textbf{fit on the training split only}.
+
+\paragraph{Model-specific cleaning.}
+Rather than one canonical preprocessing, we load the raw text once and branch
+into three pipelines whose cleaning intensity is matched to the consumer model
+(Table~\ref{tab:pipelines}). Traditional ML and the LSTM receive aggressively
+normalized text (lowercasing, contraction expansion, punctuation removal);
+numbers are kept for ML (e.g.\ ``iphone 14'') but dropped for the LSTM, whose
+embedding vocabulary contains few numerals. BERT instead receives \emph{minimal}
+cleaning (HTML and whitespace only), because its WordPiece tokenizer handles
+casing and punctuation internally.
+
+\begin{table}[h]
+    \centering
+    \caption{Three preprocessing pipelines branched from a single load.}
+    \label{tab:pipelines}
+    \begin{tabular}{lll}
+        \toprule
+        \textbf{Pipeline} & \textbf{Target model} & \textbf{Cleaning} \\
+        \midrule
+        \texttt{for\_ml}   & Traditional ML  & lowercase + expand contractions + strip punct., keep numbers \\
+        \texttt{for\_lstm} & Siamese LSTM    & same as above, but remove numbers \\
+        \texttt{for\_bert} & BERT Cross-Enc. & minimal (HTML \& whitespace only) \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\paragraph{Features for traditional ML.}
+The \texttt{for\_ml} pipeline produces two complementary representations. (i) A
+set of \textbf{10 hand-crafted features} capturing length and lexical-overlap
+structure: per-question character length and word count, absolute length
+difference and mean length, common-word and total-word counts, the
+\textbf{word-share} ratio $|A\cap B|/(|A|+|B|)$, and the cosine similarity
+between the two TF-IDF vectors. (ii) A \textbf{TF-IDF} representation
+(unigrams, English stopwords removed, \texttt{min\_df}\,$=2$,
+\texttt{sublinear\_tf}), where each question is vectorized separately and the two
+vectors are horizontally stacked so a linear model can attend to each question
+independently, yielding a sparse $323{,}432 \times 93{,}012$ training matrix.
+
+% ----------------------------------------------------------------------------
+\subsection{Traditional ML Baselines}
+% ----------------------------------------------------------------------------
+
+The traditional baselines establish how far purely lexical signals carry on this
+task and serve as the reference point for the neural models. We compare
+\textbf{eight} classifiers across the two feature views above: Logistic
+Regression (on hand features and on TF-IDF), a calibrated Linear SVM, Multinomial
+Naive Bayes, Decision Tree, Random Forest, Gradient Boosting, and XGBoost.
+
+\paragraph{Feature engineering: \texttt{tfidf\_word\_share}.}
+For the tree ensembles we add an IDF-weighted version of word overlap inspired by
+the \emph{anokas} Kaggle baseline. Whereas plain word-share counts every shared
+word equally, this feature weights each shared word by its inverse document
+frequency,
+\[
+  \texttt{tfidf\_word\_share}
+  = \frac{\sum_{w \in A\cap B} \mathrm{idf}(w)}
+         {\sum_{w \in A\cup B} \mathrm{idf}(w)},
+\]
+so that overlap on \emph{rare, content-bearing} words counts for more than
+overlap on common words. It is computed directly from the stored TF-IDF matrices
+(no re-tokenization), bringing the ensemble hand-feature count to $11$.
+
+\paragraph{Tuning protocol.}
+Hyperparameters are selected by \textbf{minimizing validation log loss} over a
+small grid per model (e.g.\ the regularization strength $C$ for the linear models,
+\texttt{alpha} for Naive Bayes, and \texttt{max\_depth}/\texttt{learning\_rate}/
+\texttt{subsample} for the ensembles). We tune against the held-out validation
+split directly rather than with $k$-fold cross-validation, because the
+$323$K-row training set makes repeated CV refits prohibitively expensive; the
+frozen split keeps this selection honest. Test metrics in Table~\ref{tab:tradml}
+are reported only for the refit best configuration of each model.
+
+\begin{table}[h]
+    \centering
+    \caption{Traditional ML baselines on the shared test split. Best value per
+    F1 / log-loss column---our imbalance-aware selection metrics---in
+    \textbf{bold}. Boosted trees on hand features win on F1 and log loss; the
+    TF-IDF linear models only lead on raw accuracy.}
+    \label{tab:tradml}
+    \small
+    \begin{tabular}{llccccc}
+        \toprule
+        \textbf{Model} & \textbf{Features} & \textbf{Val F1} & \textbf{Test Acc} & \textbf{Test F1} & \textbf{Log loss} & \textbf{Size (KB)} \\
+        \midrule
+        Logistic Regression & Hand    & 0.499  & 0.655 & 0.505 & 0.563 & 0.8 \\
+        Logistic Regression & TF-IDF  & 0.630  & 0.755 & 0.628 & 0.512 & 727 \\
+        Linear SVM          & TF-IDF  & 0.621  & 0.746 & 0.640 & 0.514 & 2{,}182 \\
+        Naive Bayes         & TF-IDF  & 0.636  & 0.745 & 0.633 & 0.599 & 2{,}907 \\
+        Decision Tree       & Hand    & 0.628  & 0.709 & 0.632 & 0.508 & 40 \\
+        Random Forest       & Hand    & 0.647  & 0.727 & 0.646 & 0.487 & 414{,}826 \\
+        Gradient Boosting   & Hand    & 0.644  & 0.729 & 0.645 & 0.484 & 1{,}766 \\
+        \textbf{XGBoost}    & Hand+   & \textbf{0.653} & 0.733 & \textbf{0.651} & \textbf{0.480} & 4{,}188 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\paragraph{Findings.}
+Because the classes are imbalanced, we rank models by \textbf{F1 and log loss}
+rather than accuracy. By that criterion the hand-feature boosted trees win:
+\textbf{XGBoost is the strongest baseline overall}, with the best F1 ($0.651$)
+and the lowest, best-calibrated log loss ($0.480$), because its IDF-weighted
+overlap and length features recover more of the minority duplicate class. The
+TF-IDF linear models post slightly higher raw accuracy (LR $0.755$) but lower F1
+($\sim$0.62--0.64); accuracy mostly rewards predicting the majority
+non-duplicate class, so under the imbalance-aware metric these models fall behind
+the ensembles. \texttt{tfidf\_word\_share} is consistently the most important
+feature in the ensembles. Notably, the best tree models reach this F1 with a
+$\sim$4\,MB checkpoint and sub-millisecond inference, whereas Random Forest pays
+a $400$\,MB footprint for slightly worse numbers.
+
+\paragraph{Limitation $\rightarrow$ motivation for deep models.}
+Across every classifier and feature set, F1 plateaus around $0.65$
+(and accuracy in the $73$--$76\%$ range). The ceiling is structural: all of these
+features ultimately measure \emph{lexical overlap}, so they cannot recognize a
+duplicate that is phrased with different words. For example, ``How to learn
+Python'' and ``Best way to study Python'' share almost no tokens yet express the
+same intent, and every lexical model here misses it. Closing this semantic gap is
+precisely what motivates the contextual models that follow---the Word2Vec\,+\,LSTM
+encoder and the Transformer Bi-/Cross-Encoders---whose results in
+Section~3 confirm that modeling meaning, rather than word overlap,
+is what lifts F1 past the traditional ceiling.
